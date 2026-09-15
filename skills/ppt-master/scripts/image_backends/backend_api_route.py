@@ -67,9 +67,7 @@ def _resolve_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/chat/completions"
 
 def _message_image_uri(message: dict) -> str | None:
-    """
-    Locate the generated image in a chat completion message.
-    """
+    """Locate the generated image in a chat completion message."""
     images = message.get("images")
     if images:
         url = images[0].get("image_url")
@@ -85,10 +83,7 @@ def _generate_image(api_key: str, prompt: str,
                     aspect_ratio: str = "1:1", image_size: str = "1K",
                     output_dir: str = None, filename: str = None,
                     model: str = DEFAULT_MODEL, base_url: str = DEFAULT_ENDPOINT) -> str:
-    """
-    Image generation via API Route.
-    """
-
+    """Image generation via API Route."""
     url = _resolve_url(base_url)
 
     headers = {
@@ -111,108 +106,86 @@ def _generate_image(api_key: str, prompt: str,
         }
     }
 
-    print(f"[API Route]")
-    print(f"  Model:        {model}")
-    print(f"  Prompt:       {prompt[:120]}{'...' if len(prompt) > 120 else ''}")
-    print(f"  Aspect Ratio: {aspect_ratio}")
-    print(f"  Image Size:   {image_size}")
-    print()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
 
-    start_time = time.time()
-    print(f"  [..] Generating...", end="", flush=True)
+            if resp.status_code == 200:
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    raise ValueError(f"API Route response contained no choices: {data}")
 
-    # Heartbeat thread
-    heartbeat_stop = threading.Event()
+                message = choices[0].get("message", {})
+                image_uri = _message_image_uri(message)
+                if not image_uri:
+                    content_preview = str(message.get("content", ""))[:200]
+                    raise ValueError(
+                        f"API Route response contained no extractable image data. "
+                        f"Message preview: {content_preview}"
+                    )
 
-    def _heartbeat():
-        while not heartbeat_stop.is_set():
-            heartbeat_stop.wait(5)
-            if not heartbeat_stop.is_set():
-                elapsed = time.time() - start_time
-                print(f" {elapsed:.0f}s...", end="", flush=True)
+                data_bytes, ext = decode_data_uri(image_uri)
+                output_path = resolve_output_path(
+                    output_dir=output_dir,
+                    filename=filename,
+                    prefix="api_route",
+                    ext=ext
+                )
+                save_image_bytes(data_bytes, output_path)
+                return output_path
 
-    hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-    hb_thread.start()
+            elif is_rate_limit_error(resp.status_code):
+                delay = retry_delay(attempt, resp=resp)
+                print(f"[API Route] Rate limit hit (attempt {attempt}/{MAX_RETRIES}), waiting {delay:.1f}s...")
+                time.sleep(delay)
+                continue
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=300)
-        if response.status_code != 200:
-            raise http_error(response, "API Route image generation")
-        result = response.json()
-    finally:
-        heartbeat_stop.set()
-        hb_thread.join(timeout=1)
+            elif is_permanent_error(resp.status_code):
+                raise http_error("API Route", resp.status_code, resp.text)
 
-    elapsed = time.time() - start_time
-    print(f"\n  [DONE] Image generated ({elapsed:.1f}s)")
+            else:
+                delay = retry_delay(attempt, resp=resp)
+                print(f"[API Route] HTTP {resp.status_code} (attempt {attempt}/{MAX_RETRIES}), retrying in {delay:.1f}s...")
+                time.sleep(delay)
 
-    if result.get("choices"):
-        message = result["choices"][0]["message"]
-        image_uri = _message_image_uri(message)
-        if image_uri:
-            image_data, content_type = decode_data_uri(image_uri)
-            path = resolve_output_path(prompt, output_dir, filename, ".png")
-            return save_image_bytes(image_data, path, content_type)
+        except requests.exceptions.RequestException as e:
+            if attempt == MAX_RETRIES:
+                raise RuntimeError(f"API Route request failed after {MAX_RETRIES} attempts: {e}")
+            delay = retry_delay(attempt)
+            print(f"[API Route] Network error (attempt {attempt}/{MAX_RETRIES}): {e}, retrying in {delay:.1f}s...")
+            time.sleep(delay)
 
-    raise RuntimeError("No image was generated. The server may have refused the request.")
+    raise RuntimeError(f"API Route generation failed after {MAX_RETRIES} attempts.")
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
-# ║  Public Entry Point                                             ║
+# ║  Public API                                                      ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-def generate(prompt: str,
-             aspect_ratio: str = "1:1", image_size: str = "1K",
-             output_dir: str = None, filename: str = None,
-             model: str = None, max_retries: int = MAX_RETRIES) -> str:
-    """
-    API Route image generation with automatic retry.
-
-    Reads credentials from the current process environment or a `.env` file:
-      API_ROUTE_API_KEY
-      API_ROUTE_BASE_URL
-      API_ROUTE_MODEL (optional override)
-    """
-    api_key = os.environ.get("API_ROUTE_API_KEY")
-    base_url = os.environ.get("API_ROUTE_BASE_URL") or DEFAULT_ENDPOINT
-
+def generate(prompt: str, aspect_ratio: str = "1:1", image_size: str = "1K",
+             output_dir: str = None, filename: str = None) -> str:
+    """Generate an image using the API Route backend."""
+    api_key = os.getenv("API_ROUTE_API_KEY")
     if not api_key:
         raise ValueError(
-            "No API key found. Set API_ROUTE_API_KEY in the current environment or a .env file."
+            "API_ROUTE_API_KEY is not set. "
+            "Please set it via environment variable or in your .env file."
         )
 
-    if model is None:
-        model = os.environ.get("API_ROUTE_MODEL") or DEFAULT_MODEL
+    model = os.getenv("API_ROUTE_MODEL", DEFAULT_MODEL)
+    base_url = os.getenv("API_ROUTE_BASE_URL", DEFAULT_ENDPOINT)
 
-    image_size = normalize_image_size(image_size)
+    normalized_size = normalize_image_size(image_size, VALID_IMAGE_SIZES)
+    ratio = aspect_ratio if aspect_ratio in VALID_ASPECT_RATIOS else "1:1"
 
-    if aspect_ratio not in VALID_ASPECT_RATIOS:
-        raise ValueError(f"Invalid aspect ratio '{aspect_ratio}'. Valid: {VALID_ASPECT_RATIOS}")
-
-    if image_size not in VALID_IMAGE_SIZES:
-        raise ValueError(f"Invalid image size '{image_size}'. Valid: {VALID_IMAGE_SIZES}")
-
-    last_error = None
-    for attempt in range(max_retries + 1):
-        try:
-            return _generate_image(api_key, prompt,
-                                   aspect_ratio, image_size, output_dir,
-                                   filename, model, base_url)
-        except Exception as e:
-            last_error = e
-            if is_permanent_error(e):
-                raise
-            if attempt < max_retries and is_rate_limit_error(e):
-                delay = retry_delay(attempt, rate_limited=True)
-                print(f"\n  [WARN] Rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
-                      f"Waiting {delay}s before retry...")
-                time.sleep(delay)
-            elif attempt < max_retries:
-                delay = retry_delay(attempt, rate_limited=False)
-                print(f"\n  [WARN] Error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
-                      f"Retrying in {delay}s...")
-                time.sleep(delay)
-            else:
-                break
-
-    raise RuntimeError(f"Failed after {max_retries + 1} attempts. Last error: {last_error}")
+    return _generate_image(
+        api_key=api_key,
+        prompt=prompt,
+        aspect_ratio=ratio,
+        image_size=normalized_size,
+        output_dir=output_dir,
+        filename=filename,
+        model=model,
+        base_url=base_url
+    )
